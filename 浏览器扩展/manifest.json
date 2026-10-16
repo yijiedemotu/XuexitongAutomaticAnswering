@@ -1,0 +1,33 @@
+{
+  "manifest_version": 3,
+  "name": "学习通自动答题助手",
+  "description": "在学习通作业页面中调用用户选择的 AI 模型辅助答题。",
+  "version": "1.0.0",
+  "permissions": ["storage"],
+  "host_permissions": [
+    "*://*.chaoxing.com/*",
+    "*://*.xuexitong.com/*",
+    "https://ark.cn-beijing.volces.com/*",
+    "https://api.deepseek.com/*"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "content_scripts": [
+    {
+      "matches": ["*://*.chaoxing.com/*", "*://*.xuexitong.com/*"],
+      "js": ["page-bridge.js"],
+      "run_at": "document_start",
+      "world": "MAIN"
+    },
+    {
+      "matches": ["*://*.chaoxing.com/*", "*://*.xuexitong.com/*"],
+      "js": ["content.js"],
+      "run_at": "document_idle"
+    }
+  ],
+  "action": {
+    "default_title": "学习通自动答题助手",
+    "default_popup": "popup.html"
+  }
+}
