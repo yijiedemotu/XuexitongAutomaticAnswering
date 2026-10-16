@@ -15,3 +15,6 @@ desktop.ini
 # 本地私密配置（如把 Key 放在单独文件里）
 config.local.js
 *.local.js
+
+# 旧版脚本：内含已失效的硬编码 API Key，仅作本机对照，禁止提交
+超星学习通自动答题助手.txt
