@@ -789,11 +789,22 @@
         showPanel();
         log('开始处理题目…', 'step');
 
-        const allQuestions = collectQuestions();
+        let allQuestions = collectQuestions();
+        if (!allQuestions.length) {
+            log('暂未识别到题目，等待页面内容加载后重试…', 'warn');
+            for (let attempt = 0; attempt < 4 && !stopRequested; attempt++) {
+                await delay(350);
+                allQuestions = collectQuestions();
+                if (allQuestions.length) {
+                    log(`页面加载后识别到 ${allQuestions.length} 道题目，继续处理。`, 'ok');
+                    break;
+                }
+            }
+        }
         const total = allQuestions.length;
         if (!total) {
             log('识别到 0 道题目', 'err');
-            log('未识别到题目：请确认已进入作业作答页面（.questionLi 容器）', 'err');
+            log('兜底提示：当前页面结构未识别出题目，尚未请求 AI。请打开具体作业的答题页并等待题目显示，再点“开始答题”；仍失败时请提供题目页面截图。', 'warn');
             finish(); return;
         }
 
@@ -822,15 +833,17 @@
         log(`识别到 ${total} 道题目；本次处理第 ${startAt}–${endAt} 题，共 ${questions.length} 道，${orderName}`, 'step');
 
         let ok = 0, fail = 0, skipped = 0;
+        const failedQuestionNumbers = [];
         for (let i = 0; i < questions.length; i++) {
             if (stopRequested) { log('已被用户停止', 'warn'); break; }
             const el = questions[i];
+            const questionNo = Math.max(1, allQuestions.indexOf(el) + 1);
             setProgress((i / questions.length) * 100);
-            log(`—— 第 ${i + 1}/${questions.length} 题 ——`, 'step');
+            log(`—— 第 ${questionNo} 题（处理进度 ${i + 1}/${questions.length}）——`, 'step');
 
             if (CONFIG.SKIP_ANSWERED && isQuestionAnswered(el)) {
                 skipped++;
-                log(`第 ${i + 1} 题跳过：检测到已有答案`, 'warn');
+                log(`第 ${questionNo} 题跳过：检测到已有答案`, 'warn');
                 el.classList.remove('cx-auto-failed');
                 continue;
             }
@@ -846,16 +859,18 @@
                 const r = await handleQuestion(el);
                 if (r.ok) {
                     ok++;
-                    log(`第 ${i + 1} 题 ✓ ${r.detail}`, 'ok');
+                    log(`第 ${questionNo} 题 ✓ ${r.detail}`, 'ok');
                     el.classList.add('cx-auto-filled'); el.classList.remove('cx-auto-failed');
                 } else {
                     fail++;
-                    log(`第 ${i + 1} 题 ✗ ${r.detail}`, 'err');
+                    failedQuestionNumbers.push(questionNo);
+                    log(`第 ${questionNo} 题 ✗ ${r.detail}`, 'err');
                     el.classList.add('cx-auto-failed'); el.classList.remove('cx-auto-filled');
                 }
             } catch (e) {
                 fail++;
-                log(`第 ${i + 1} 题异常: ${e.message}`, 'err');
+                failedQuestionNumbers.push(questionNo);
+                log(`第 ${questionNo} 题异常: ${e.message}`, 'err');
             }
 
             if (i < questions.length - 1 && !stopRequested) await delay(CONFIG.DELAY_BETWEEN_QUESTIONS);
@@ -863,6 +878,12 @@
 
         setProgress(100);
         log(`全部完成：成功 ${ok}，失败 ${fail}，跳过 ${skipped}`, ok >= fail ? 'ok' : 'err');
+        if (failedQuestionNumbers.length) {
+            const uniqueFailed = [...new Set(failedQuestionNumbers)];
+            const visibleNumbers = uniqueFailed.slice(0, 12).join('、');
+            const more = uniqueFailed.length > 12 ? `等（另有 ${uniqueFailed.length - 12} 题）` : '';
+            log(`兜底处理：第 ${visibleNumbers} 题${more}仍未能自动作答，已跳过并标红。请检查这些题并手动补答；确认题干和选项后可重试。`, 'warn');
+        }
 
         if (CONFIG.AUTO_SAVE && !stopRequested) {
             await delay(400);
@@ -893,13 +914,45 @@
         if (!aiAnswer) return { ok: false, detail: '未获取到 AI 答案' };
         log(`AI 返回：${JSON.stringify(aiAnswer).slice(0, 160)}`, 'ai');
 
-        if (type === TYPE.SINGLE) return fillChoiceSingle(el, options, aiAnswer);
-        if (type === TYPE.MULTI) return fillChoiceMulti(el, options, aiAnswer);
-        if (type === TYPE.JUDGE) return fillJudge(el, options, aiAnswer);
+        const applyChoiceAnswer = answer => {
+            if (type === TYPE.SINGLE) return fillChoiceSingle(el, options, answer);
+            if (type === TYPE.MULTI) return fillChoiceMulti(el, options, answer);
+            if (type === TYPE.JUDGE) return fillJudge(el, options, answer);
+            return null;
+        };
+        if (type === TYPE.SINGLE || type === TYPE.MULTI || type === TYPE.JUDGE) {
+            const firstResult = applyChoiceAnswer(aiAnswer);
+            if (!firstResult || firstResult.ok || !['unmatched-answer', 'empty-answer'].includes(firstResult.reason)) return firstResult;
+
+            log('AI 答案无法对应页面选项，正在按页面实际选项重新询问一次…', 'warn');
+            const retryPrompt = buildOptionFallbackPrompt(stem, typeName, type, options, aiAnswer);
+            const retryAnswer = await askAI(retryPrompt, 0);
+            let retryDetail = '兜底重试没有返回可用答案';
+            if (retryAnswer) {
+                log(`兜底重试返回：${JSON.stringify(retryAnswer).slice(0, 160)}`, 'ai');
+                const retryResult = applyChoiceAnswer(retryAnswer);
+                if (retryResult && retryResult.ok) {
+                    return { ...retryResult, detail: `兜底重试匹配成功：${retryResult.detail}` };
+                }
+                if (retryResult && retryResult.detail) retryDetail = retryResult.detail;
+            }
+            return {
+                ok: false,
+                reason: 'manual-review',
+                detail: `AI 答案无法对应页面选项；${retryDetail}。该题已跳过并标红，请人工核对。`
+            };
+        }
         if (type === TYPE.FILL) return fillFill(el, aiAnswer);
         if (type === TYPE.SHORT) return fillShort(el, aiAnswer);
         // 未知类型：有选项按单选，否则按填空
         return options.length >= 2 ? fillChoiceSingle(el, options, aiAnswer) : fillFill(el, aiAnswer);
+    }
+
+    function buildOptionFallbackPrompt(stem, typeName, type, options, previousAnswer) {
+        const optionText = options.map(o => `${o.letter || '?'}：${o.text}`).join('\n');
+        const output = type === TYPE.MULTI ? '{"answers":["A","C"]}' : '{"answer":"A"}';
+        const previous = JSON.stringify(previousAnswer).slice(0, 300);
+        return `请重新判断下面这道${typeName}。\n题目：${stem}\n页面中的可选项（只能从这些选项中选择）：\n${optionText}\n上一次回答无法对应页面选项：${previous}\n要求：只根据题目和选项作答；答案必须是上面列出的选项字母，禁止输出选项正文、解释或其他文字；只输出严格 JSON：${output}`;
     }
 
     function buildPrompt(stem, typeName, type, options, el) {
@@ -930,12 +983,12 @@
 
     function fillChoiceSingle(el, options, ans) {
         const a = normalizeAnswer(ans, TYPE.SINGLE, options);
-        if (!a.letters.length && !a.values.length) return { ok: false, detail: '答案为空' };
+        if (!a.letters.length && !a.values.length) return { ok: false, reason: 'empty-answer', detail: '答案为空' };
 
         let target = null;
         if (a.letters.length) target = options.find(o => (o.letter || '').toUpperCase() === a.letters[0]);
         if (!target && a.values.length) target = matchByText(options, a.values[0]);
-        if (!target) return { ok: false, detail: `未匹配到选项 ${a.letters.join('') || a.values[0]}` };
+        if (!target) return { ok: false, reason: 'unmatched-answer', detail: `未匹配到选项 ${a.letters.join('') || a.values[0]}` };
 
         clearQuestion(el, false);
         selectOption(target, false);
@@ -944,7 +997,7 @@
 
     function fillChoiceMulti(el, options, ans) {
         const a = normalizeAnswer(ans, TYPE.MULTI, options);
-        if (!a.letters.length && !a.values.length) return { ok: false, detail: '答案为空' };
+        if (!a.letters.length && !a.values.length) return { ok: false, reason: 'empty-answer', detail: '答案为空' };
 
         const targets = [];
         for (const L of a.letters) {
@@ -955,7 +1008,10 @@
             const t = matchByText(options, v);
             if (t && !targets.includes(t)) targets.push(t);
         }
-        if (!targets.length) return { ok: false, detail: `未匹配到选项 ${a.letters.join('')}` };
+        if (!targets.length) {
+            const answerText = [...a.letters, ...a.values].join('、');
+            return { ok: false, reason: 'unmatched-answer', detail: `未匹配到多选项 ${answerText || '（空答案）'}` };
+        }
 
         clearQuestion(el, true);
         targets.forEach(t => selectOption(t, true));
@@ -980,7 +1036,10 @@
             }
         }
         if (!target && a.values.length) target = matchByText(options, a.values[0]);
-        if (!target) return { ok: false, detail: `未匹配到判断选项 ${JSON.stringify(a)}` };
+        if (!target) {
+            if (!a.judges.length && !a.values.length) return { ok: false, reason: 'empty-answer', detail: '判断题答案为空' };
+            return { ok: false, reason: 'unmatched-answer', detail: `未匹配到判断选项 ${JSON.stringify(a)}` };
+        }
 
         clearQuestion(el, false);
         selectOption(target, false);
@@ -1057,13 +1116,14 @@
     //  五、AI 调用
     // =========================================================
 
-    async function askAI(prompt) {
+    async function askAI(prompt, maxRetries = CONFIG.MAX_RETRIES) {
         if (CONFIG.ENABLE_CACHE) {
             const key = cacheKey(prompt);
             const hit = readCache(key);
             if (hit) { log('命中本地缓存，跳过 API 请求', 'hit'); return hit; }
+            log('本地答案缓存未命中，改用当前选择的 AI 模型回答。', 'step');
         }
-        for (let attempt = 0; attempt <= CONFIG.MAX_RETRIES; attempt++) {
+        for (let attempt = 0; attempt <= maxRetries; attempt++) {
             try {
                 const ans = await callAPI(prompt);
                 if (ans) {
@@ -1074,7 +1134,7 @@
                 log(`API 请求失败(${attempt + 1}/${CONFIG.MAX_RETRIES + 1})：${e.message}`, 'err');
                 if (e && e.retryable === false) break;
             }
-            if (attempt < CONFIG.MAX_RETRIES) await delay(1000 * (attempt + 1));
+                if (attempt < maxRetries) await delay(1000 * (attempt + 1));
         }
         return null;
     }
@@ -1208,8 +1268,8 @@
     }
 
     function cacheKey(s) {
-        try { return btoa(unescape(encodeURIComponent(s))).slice(0, 48); }
-        catch (e) { return String(s.length) + ':' + s.slice(0, 40); }
+        // 缓存仅存在本页内存，直接使用完整提示词，避免相似题或兜底重试互相撞键。
+        return String(s);
     }
     function readCache(k) {
         const d = answerCache.get(k);
