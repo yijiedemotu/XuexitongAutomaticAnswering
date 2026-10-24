@@ -207,9 +207,37 @@
     loadSettings();
     loadDockPosition();
 
-    // 学习通题型编码（来自页面 #answertype<qid> 隐藏域）
+    // 内部题型（与页面原始编码解耦，便于兼容不同版本的隐藏域）
     const TYPE = { SINGLE: 0, MULTI: 1, FILL: 2, JUDGE: 3, SHORT: 4 };
     const TYPE_NAME = { 0: '单选题', 1: '多选题', 2: '填空题', 3: '判断题', 4: '简答题' };
+    // 页面 input[name="type<qid>"] 的原始编码：0单选 1多选 3判断 2/9/10填空
+    // 4/5/6/7/8/18 都是主观题（简答、论述、材料、名词解释等），共用 textarea[name="answer<qid>"]
+    const RAW_MULTI_TYPES = new Set([1, 21]);
+    const RAW_FILL_TYPES = new Set([2, 9, 10]);
+    const RAW_JUDGE_TYPES = new Set([3]);
+    const RAW_SHORT_TYPES = new Set([4, 5, 6, 7, 8, 18]);
+
+    function typeFromRawCode(value) {
+        const code = parseInt(value, 10);
+        if (!Number.isFinite(code)) return null;
+        if (code === 0) return TYPE.SINGLE;
+        if (RAW_MULTI_TYPES.has(code)) return TYPE.MULTI;
+        if (RAW_FILL_TYPES.has(code)) return TYPE.FILL;
+        if (RAW_JUDGE_TYPES.has(code)) return TYPE.JUDGE;
+        if (RAW_SHORT_TYPES.has(code)) return TYPE.SHORT;
+        return null;
+    }
+
+    function typeFromName(name) {
+        const text = String(name || '');
+        if (!text) return null;
+        if (text.includes('多选') || text.includes('不定项')) return TYPE.MULTI;
+        if (text.includes('判断')) return TYPE.JUDGE;
+        if (text.includes('填空')) return TYPE.FILL;
+        if (/简答|论述|材料|名词解释|计算题|分析题|综合题|解答题/.test(text)) return TYPE.SHORT;
+        if (text.includes('单选')) return TYPE.SINGLE;
+        return null;
+    }
 
     // ---------- 样式 ----------
     addScriptStyles(`
@@ -319,10 +347,48 @@
 
     /** 取题目唯一 id */
     function qidOf(el) {
-        const raw = el.getAttribute('data') || (el.id || '').replace(/^question/, '') || '';
+        const raw = el.getAttribute('data') || (el.id || '').replace(/^question|^sigleQuestionDiv_/, '') || '';
         if (raw) return raw;
-        const opt = el.querySelector('.answerBg[qid]');
-        return opt ? opt.getAttribute('qid') : '';
+        const opt = el.querySelector('.answerBg[qid], .saveSingleSelect[qid], .saveMultiSelect[qid]');
+        if (opt) return opt.getAttribute('qid');
+        const input = el.querySelector('input[name="questionId"]');
+        return input ? String(input.value || '').trim() : '';
+    }
+
+    /** 读取页面隐藏的题型信息（不同版本分别放在 type<qid> / answertype<qid> / typeName<qid>） */
+    function readQuestionTypeInfo(el) {
+        const qid = qidOf(el);
+        let rawCode = '';
+        const codeInput = qid ? el.querySelector(`input[name="type${qid}"]`) : null;
+        if (codeInput && String(codeInput.value || '').trim() !== '') rawCode = codeInput.value;
+        if (!rawCode && qid) {
+            const legacy = document.getElementById('answertype' + qid);
+            if (legacy && String(legacy.value || '').trim() !== '') rawCode = legacy.value;
+        }
+
+        let name = '';
+        const nameInput = qid ? el.querySelector(`input[name="typeName${qid}"]`) : null;
+        if (nameInput) name = String(nameInput.value || '').trim();
+        if (!name) name = String(el.getAttribute('typeName') || '').trim();
+        if (!name) {
+            // 题型标签通常是 .colorShallow 的 aria-label，例如“26. (材料题, 15.0分)”
+            const label = el.querySelector('.colorShallow, .mark_name [aria-label]');
+            if (label) {
+                const aria = label.getAttribute('aria-label') || label.textContent || '';
+                const match = String(aria).match(/(单选题|多选题|不定项选择题|判断题|填空题|简答题|论述题|材料题|名词解释)/);
+                if (match) name = match[1];
+            }
+        }
+        if (!name) {
+            // 大题标题：三、 材料题 （共 2题，30.0 分）
+            const section = el.closest('.mark_table');
+            const title = section && section.querySelector('.type_tit');
+            if (title) {
+                const match = String(title.textContent || '').match(/(单选题|多选题|不定项选择题|判断题|填空题|简答题|论述题|材料题|名词解释)/);
+                if (match) name = match[1];
+            }
+        }
+        return { qid, rawCode, name };
     }
 
     /** 题干文本：只取 .mark_name / h3，剔除选项区与题号 */
@@ -351,7 +417,7 @@
         // 清理题号、题型标注、分数、空白
         text = text
             .replace(/^[\s\u3000]*\d+\s*[.、,．)）]\s*/, '')
-            .replace(/[（(]\s*(单选题|多选题|判断题|填空题|简答题|论述题|名词解释|不定项选择题)\s*[)）]/g, '')
+            .replace(/[（(]\s*(单选题|多选题|判断题|填空题|简答题|论述题|名词解释|材料题|综合题|分析题|计算题|解答题|不定项选择题)\s*[)）]/g, '')
             .replace(/[（(]\s*\d+(\.\d+)?\s*分\s*[)）]/g, '')
             .replace(/[\s\u3000]+/g, ' ')
             .trim();
@@ -376,12 +442,13 @@
         for (const node of nodes) {
             const letterEl = node.querySelector('.num_option, .num_option_dx, .choice_letter, span[data]');
             const textEl = node.querySelector('.answer_p, p, .option_text, label');
-            // 选项字母：优先 span 的 data，其次 aria-label 首字母，最后纯文本
-            let letter = letterEl ? (letterEl.getAttribute('data') || '').trim() : '';
-            const label = (node.getAttribute('aria-label') || '').trim();
+            // 页面显示的字母和 data 中的作答值不是一回事（判断题 data 常为 true/false）。
+            const data = letterEl ? (letterEl.getAttribute('data') || '').trim() : '';
             const letterText = letterEl ? (letterEl.textContent || '').trim() : '';
-            if (!letter && /^[A-Z]$/.test(letterText)) letter = letterText;
-            if (!letter && /^[A-Z]/.test(label)) letter = label.charAt(0);
+            const ariaLabel = (node.getAttribute('aria-label') || '').trim();
+            const pageLetter = readDisplayedOptionLetter(letterText)
+                || readDisplayedOptionLetter(ariaLabel)
+                || readDisplayedOptionLetter(node.textContent || '');
             // 选项正文
             let text = textEl ? (textEl.textContent || '').trim() : '';
             if (!text) {
@@ -389,29 +456,117 @@
                 text = (node.textContent || '').trim().replace(/^[A-Z]\s*[.、．]?\s*/, '');
             }
             text = text.replace(/\s+/g, ' ').trim();
-            if (!letter && !text) continue;
-            opts.push({ letter, text, data: letter, node, hidden: !isVisible(node) });
+            if (!pageLetter && !text) continue;
+            opts.push({ letter: pageLetter, pageLetter, text, data, node, hidden: !isVisible(node) });
         }
         return opts;
     }
 
-    /** 题型：以页面隐藏域 #answertype<qid> 为准，辅以 DOM 特征 */
-    function getQuestionType(el) {
-        const qid = qidOf(el);
-        const hidden = qid ? document.getElementById('answertype' + qid) : null;
-        if (hidden && hidden.value !== '' && hidden.value != null) {
-            const t = parseInt(hidden.value, 10);
-            if (!isNaN(t)) return t;
+    /** 读取页面明确显示的单个选项字母；aria-label 可能是“A对选择”这类无空格形式。 */
+    function readDisplayedOptionLetter(value) {
+        const text = String(value || '').trim();
+        const match = text.match(/^([A-Z])(?=$|[^A-Za-z0-9])/i);
+        return match ? match[1].toUpperCase() : '';
+    }
+
+    /** 页面标签完整且唯一时沿用原字母；否则按可见选项的屏幕位置生成 A/B/C… */
+    function prepareAnswerOptions(options) {
+        const visible = options.filter(option => !option.hidden);
+        const candidates = visible.length ? visible : options;
+        const pageLetters = candidates.map(option => String(option.pageLetter || '').trim().toUpperCase());
+        const hasUniquePageLetters = pageLetters.length > 0
+            && pageLetters.every(letter => /^[A-Z]$/.test(letter))
+            && new Set(pageLetters).size === pageLetters.length;
+
+        if (hasUniquePageLetters) {
+            return candidates.map((option, index) => ({
+                ...option,
+                answerLetter: pageLetters[index]
+            }));
         }
-        const tn = el.getAttribute('typeName') || '';
-        if (tn.includes('多选') || tn.includes('不定项')) return TYPE.MULTI;
-        if (tn.includes('判断')) return TYPE.JUDGE;
-        if (tn.includes('填空')) return TYPE.FILL;
-        if (tn.includes('简答') || tn.includes('论述') || tn.includes('名词解释')) return TYPE.SHORT;
-        if (el.querySelector('.num_option_dx, input[type="checkbox"]')) return TYPE.MULTI;
-        if (el.querySelector('.num_option, input[type="radio"]')) return TYPE.SINGLE;
+
+        const visualOrder = sortOptionsByDisplayOrder(candidates);
+        return visualOrder.map((option, index) => ({
+            ...option,
+            answerLetter: optionLetterFromIndex(index)
+        }));
+    }
+
+    /** 按屏幕上的行列位置排序，并让同一行内的选项按从左到右排列。 */
+    function sortOptionsByDisplayOrder(options) {
+        const positioned = options.map((option, index) => {
+            const rect = option.node && option.node.getBoundingClientRect
+                ? option.node.getBoundingClientRect()
+                : null;
+            return { option, index, top: rect ? rect.top : NaN, left: rect ? rect.left : NaN };
+        });
+        const measuredCount = positioned.filter(item => Number.isFinite(item.top) && Number.isFinite(item.left)).length;
+        if (measuredCount < 2 || measuredCount !== options.length) {
+            return options;
+        }
+
+        const measured = positioned
+            .filter(item => Number.isFinite(item.top) && Number.isFinite(item.left))
+            .sort((a, b) => a.top - b.top || a.index - b.index);
+        const rows = [];
+        for (const item of measured) {
+            // 同一视觉行的 top 可能因字体或对齐方式相差几像素，按最近行归组。
+            let row = null;
+            let distance = Infinity;
+            for (const candidate of rows) {
+                const d = Math.abs(candidate.top - item.top);
+                if (d <= 4 && d < distance) {
+                    row = candidate;
+                    distance = d;
+                }
+            }
+            if (!row) {
+                row = { top: item.top, items: [] };
+                rows.push(row);
+            }
+            row.items.push(item);
+        }
+        rows.sort((a, b) => a.top - b.top);
+        return rows.flatMap(row => row.items
+            .sort((a, b) => a.left - b.left || a.index - b.index)
+            .map(item => item.option));
+    }
+
+    function optionLetterFromIndex(index) {
+        let value = index + 1;
+        let label = '';
+        while (value > 0) {
+            value--;
+            label = String.fromCharCode(65 + (value % 26)) + label;
+            value = Math.floor(value / 26);
+        }
+        return label;
+    }
+
+    function answerLetterForOption(option) {
+        return String(option && (option.answerLetter || option.letter) || '').trim().toUpperCase();
+    }
+
+    /** 题型：优先读页面隐藏域（type<qid> / answertype<qid>），再读题型名称，最后才看 DOM */
+    function getQuestionType(el) {
+        const info = readQuestionTypeInfo(el);
+        const fromCode = typeFromRawCode(info.rawCode);
+        if (fromCode !== null) return fromCode;
+        const fromName = typeFromName(info.name);
+        if (fromName !== null) return fromName;
+        if (el.querySelector('.num_option_dx, input[type="checkbox"], .saveMultiSelect')) return TYPE.MULTI;
+        if (el.querySelector('.num_option, input[type="radio"], .saveSingleSelect')) return TYPE.SINGLE;
+        // 主观题（含材料/论述）是单个 textarea[name="answer<qid>"]；填空题是 answerEditor<qid><n>
+        if (info.qid && el.querySelector(`textarea[name="answer${info.qid}"], textarea[id="answer${info.qid}"]`)) return TYPE.SHORT;
         if (el.querySelector('textarea, .textDIV')) return TYPE.FILL;
         return TYPE.SINGLE;
+    }
+
+    /** 展示用题型名称：材料题、论述题等原样保留，便于日志与提示词区分 */
+    function getQuestionTypeName(el) {
+        const info = readQuestionTypeInfo(el);
+        if (info.name) return info.name;
+        return TYPE_NAME[getQuestionType(el)] || '单选题';
     }
 
     /** 该题在页面上登记的答案类型（用于校验） */
@@ -508,68 +663,149 @@
     //  二、作答写入（驱动页面原生逻辑）
     // =========================================================
 
-    /** 让元素进入页面认可的状态：调用原生 addChoice/addMultipleChoice */
-    function selectOption(opt, multi) {
-        const node = opt.node;
-        if (!node) return false;
+    function choiceClass(multi) {
+        return multi ? 'check_answer_dx' : 'check_answer';
+    }
 
-        // 1) 首选：页面原生函数（它会自己加 check_answer 并写 #answer<qid>）
+    /** 选项真正保存选中状态的元素：真页面在 span.num_option(_dx)，部分旧版在 .answerBg 上 */
+    function optionFlag(node, multi) {
+        if (!node) return null;
+        return node.querySelector(multi ? '.num_option_dx, .saveMultiSelect' : '.num_option, .saveSingleSelect')
+            || node.querySelector('.num_option_dx, .num_option')
+            || node;
+    }
+
+    function isOptionMarked(node, multi) {
+        const cls = choiceClass(multi);
+        const flag = optionFlag(node, multi);
+        return !!((flag && flag.classList.contains(cls)) || (node && node.classList.contains(cls)));
+    }
+
+    /**
+     * 页面原生函数需要的元素必须带 qid：
+     * 真考试页把 qid 放在 span.saveSingleSelect 上，.answerBg 本身没有 qid；
+     * 旧版作业页则直接放在 .answerBg 上。传错元素会让页面写到 #answerundefined。
+     */
+    function optionActionElement(node, multi) {
+        if (!node) return null;
+        if (node.getAttribute && node.getAttribute('qid')) return node;
+        const selector = multi ? '.saveMultiSelect[qid], .num_option_dx[qid], [qid]' : '.saveSingleSelect[qid], .num_option[qid], [qid]';
+        return node.querySelector(selector) || node;
+    }
+
+    /** 按页面自己的规则重算隐藏域，保证“已选中”和“已绑定”一致 */
+    function syncChoiceHidden(el, multi) {
+        const qid = qidOf(el);
+        if (!qid) return '';
+        const cls = choiceClass(multi);
+        const content = [...el.querySelectorAll('.choice' + qid)]
+            .filter(s => s.classList.contains(cls))
+            .map(s => s.getAttribute('data') || '')
+            .join('');
+        const box = document.getElementById('answer' + qid)
+            || document.querySelector(`input[name="answers${qid}"]`);
+        if (box) box.value = content;
+        const sheet = document.getElementById('answerSheet' + qid);
+        if (sheet) content.length ? sheet.classList.add('active') : sheet.classList.remove('active');
+        return content;
+    }
+
+    function notifyAnswerContentChange() {
+        try {
+            if (extensionMode) invokePageBridge('callback', { functionName: 'answerContentChange' });
+            else {
+                const cb = page.answerContentChange || window.answerContentChange;
+                if (typeof cb === 'function') cb();
+            }
+        } catch (e) {}
+    }
+
+    /** 调用页面自己的保存流程：sync 富文本 → 暂存到服务端，避免只改前端状态 */
+    function requestQuestionSave(el) {
+        const qid = qidOf(el);
+        if (!qid) return false;
+        if (extensionMode) {
+            try { return invokePageBridge('save-question', { qid }) === true; } catch (e) { return false; }
+        }
+        try {
+            if (typeof page.saveQuestion === 'function') { page.saveQuestion(qid, qid); return true; }
+            if (typeof page.submitForm === 'function' && page.$) {
+                page.submitForm(true, page.$('#sigleQuestionDiv_' + qid));
+                return true;
+            }
+        } catch (e) { log('触发页面保存失败: ' + e.message, 'warn'); }
+        return false;
+    }
+
+    /**
+     * 让选项进入页面认可且已绑定的状态。
+     * 返回 { ok, clicked }：clicked=true 表示已走页面点击流程（页面会自行暂存）。
+     */
+    function selectOption(opt, multi, el) {
+        const node = opt && opt.node;
+        if (!node) return { ok: false, clicked: false };
+        const cls = choiceClass(multi);
+
+        // 0) 已经选中过：不要再点，点击会把答案取消
+        if (isOptionMarked(node, multi)) return { ok: true, clicked: false };
+
+        // 1) 首选：触发页面自己的点击处理（saveSingleSelect / clickSaveMultiSelect → addChoice → submitForm）
+        if (typeof node.click === 'function') {
+            try {
+                node.click();
+                if (isOptionMarked(node, multi)) {
+                    // 页面可能只改了样式却没写隐藏域，这种情况交给调用方补同步与暂存
+                    const box = hiddenAnswer(el);
+                    const bound = !box || String(box.value || '').trim().length > 0;
+                    return { ok: true, clicked: bound };
+                }
+            } catch (e) { log('选项点击失败: ' + e.message, 'warn'); }
+        }
+
+        // 2) 原生函数兜底：必须传入带 qid 的元素
+        const actionEl = optionActionElement(node, multi);
+        const qid = actionEl && actionEl.getAttribute ? actionEl.getAttribute('qid') : qidOf(el);
         const fnName = multi ? 'addMultipleChoice' : 'addChoice';
         let nativeCalled = false;
-        if (extensionMode) {
+        if (extensionMode && actionEl && qid) {
             const bridgeId = `choice-${Date.now()}-${++bridgeSequence}`;
-            node.setAttribute('data-cx-auto-bridge-id', bridgeId);
-            try { nativeCalled = invokePageBridge('choice', { functionName: fnName, elementId: bridgeId }) === true; }
+            actionEl.setAttribute('data-cx-auto-bridge-id', bridgeId);
+            try { nativeCalled = invokePageBridge('choice', { functionName: fnName, elementId: bridgeId, qid }) === true; }
             catch (e) { log('原生 ' + fnName + ' 调用异常: ' + e.message, 'warn'); }
-            node.removeAttribute('data-cx-auto-bridge-id');
+            actionEl.removeAttribute('data-cx-auto-bridge-id');
         } else {
             const fn = page[fnName] || window[fnName];
-            if (typeof fn === 'function') {
-                try { fn.call(page, node); nativeCalled = true; } catch (e) { log('原生 ' + fnName + ' 调用异常: ' + e.message, 'warn'); }
+            if (typeof fn === 'function' && actionEl) {
+                try { fn.call(page, actionEl); nativeCalled = true; } catch (e) { log('原生 ' + fnName + ' 调用异常: ' + e.message, 'warn'); }
             }
         }
+        if (nativeCalled && isOptionMarked(node, multi)) return { ok: true, clicked: false };
 
-        // 2) 校验页面状态是否真的变了
-        const marker = multi ? '.num_option_dx' : '.num_option';
-        const cls = multi ? 'check_answer_dx' : 'check_answer';
-        const flag = node.querySelector(marker);
-        const ok = nativeCalled && flag && flag.classList.contains(cls);
-
-        // 3) 原生不可用或没生效 → 手工复刻页面逻辑
-        if (!ok) {
-            const qid = node.getAttribute('qid') || qidOf(node.closest('.questionLi') || node.parentElement);
-            if (qid) {
-                if (!multi) {
-                    document.querySelectorAll('.choice' + qid).forEach(s => s.classList.remove('check_answer'));
-                }
-                if (flag) flag.classList.add(cls);
-                const content = [...document.querySelectorAll('.choice' + qid)]
-                    .filter(s => s.classList.contains(cls))
-                    .map(s => s.getAttribute('data') || '')
-                    .join('');
-                const box = document.getElementById('answer' + qid);
-                if (box) box.value = content;
-                // 答案卡高亮（可选，失败无害）
-                const sheet = document.getElementById('answerSheet' + qid);
-                if (sheet) content.length ? sheet.classList.add('active') : sheet.classList.remove('active');
-                try {
-                    if (extensionMode) invokePageBridge('callback', { functionName: 'answerContentChange' });
-                    else { const cb = page.answerContentChange || window.answerContentChange; if (typeof cb === 'function') cb(); }
-                } catch (e) {}
+        // 3) 最后兜底：按页面规则手工维护类名与隐藏域
+        if (qid) {
+            if (!multi) {
+                el.querySelectorAll('.choice' + qid).forEach(s => s.classList.remove(cls));
             }
+            const flag = optionFlag(node, multi);
+            if (flag) flag.classList.add(cls);
+            if (!node.classList.contains(cls)) node.classList.add(cls);
+            node.setAttribute('aria-checked', 'true');
+            syncChoiceHidden(el, multi);
+            notifyAnswerContentChange();
         }
-
-        // 不再补发 click：上面的原生函数本身会切换选中状态，第二次 click 会将答案取消。
-        return !!flag && flag.classList.contains(cls);
+        return { ok: isOptionMarked(node, multi), clicked: false };
     }
 
     function clearQuestion(el, multi) {
         const qid = qidOf(el);
         if (!qid) return;
-        const cls = multi ? 'check_answer_dx' : 'check_answer';
-        document.querySelectorAll('.choice' + qid).forEach(s => s.classList.remove(cls));
-        const box = document.getElementById('answer' + qid);
-        if (box) box.value = '';
+        const cls = choiceClass(multi);
+        el.querySelectorAll('.choice' + qid).forEach(s => s.classList.remove(cls));
+        el.querySelectorAll('.answerBg.' + cls).forEach(s => {
+            s.classList.remove(cls);
+            s.setAttribute('aria-checked', 'false');
+        });
+        syncChoiceHidden(el, multi);
     }
 
     /** UEditor 实例解析：先按约定 id，再从 textarea 反查 */
@@ -597,7 +833,8 @@
 
     /** 写入一个富文本答案位，返回是否成功 */
     function writeEditor(editorId, textarea, value) {
-        const html = escapeHtml(value);
+        // 主观题答案常含换行，UEditor 里需要转成 <br> 才会保留段落
+        const html = escapeHtml(value).replace(/\r?\n/g, '<br>');
         if (extensionMode && invokePageBridge('write-editor', { editorId, textareaId: textarea && textarea.id, value: html }) === true) return true;
         const ed = getEditor(editorId, textarea);
         if (ed) {
@@ -664,15 +901,26 @@
         return { ok: done > 0, detail: `已写入 ${done}/${total} 空` };
     }
 
-    /** 简答题：单个富文本 */
+    /** 简答 / 材料 / 论述：单个富文本，编辑器 id 固定为 answer<qid> */
     function fillShortAnswer(el, value) {
         const qid = qidOf(el);
         const editorId = 'answer' + qid;
         let ta = document.getElementById(editorId);
-        if (!ta || ta.tagName !== 'TEXTAREA') ta = el.querySelector('textarea') || ta;
-        if (!ta) return { ok: false, detail: '未找到简答题输入框' };
-        const ok = writeEditor(editorId, ta, String(value || '').trim());
-        return { ok, detail: ok ? '已写入简答题编辑器' : '简答题写入失败' };
+        if (!ta || ta.tagName !== 'TEXTAREA') {
+            const all = [...el.querySelectorAll('textarea')];
+            ta = all.find(t => t.id === editorId) || all.find(t => t.name === editorId) || all[0] || ta;
+        }
+        if (!ta) return { ok: false, detail: '未找到主观题输入框' };
+        const text = String(value || '').trim();
+        if (!writeEditor(editorId, ta, text)) return { ok: false, detail: '主观题写入失败' };
+
+        const recorded = readEditorAnswer(editorId, ta);
+        if (!meaningfulAnswer(recorded)) return { ok: false, detail: '写入后编辑器仍为空（页面未接收内容）' };
+
+        // 页面的提交逻辑会先 sync 富文本再暂存，这里主动走一次，避免刷新后答案丢失
+        requestQuestionSave(el);
+        const preview = String(recorded).replace(/\s+/g, ' ').trim();
+        return { ok: true, detail: `已写入主观题（${preview.length} 字）` };
     }
 
     // =========================================================
@@ -706,6 +954,11 @@
                 }
                 if (typeof v === 'object') return extractRawAnswers(v);
             }
+            // 材料题可能按小问编号返回 {"1":"…","2":"…"}，没有固定字段名
+            const keys = Object.keys(ans);
+            if (keys.length) {
+                return keys.sort((a, b) => (+a || 0) - (+b || 0)).map(k => ans[k]);
+            }
         }
         return [];
     }
@@ -714,7 +967,7 @@
     function normalizeAnswer(ans, type, options) {
         const raw = extractRawAnswers(ans);
         const out = { letters: [], judges: [], values: [] };
-        const letterSet = options.map(o => (o.letter || '').toUpperCase()).filter(Boolean);
+        const letterSet = options.map(answerLetterForOption).filter(Boolean);
 
         const pushValue = (v) => {
             if (v === undefined || v === null) return;
@@ -898,9 +1151,10 @@
 
     async function handleQuestion(el) {
         const type = getQuestionType(el);
-        const typeName = TYPE_NAME[type] || '单选题';
+        const typeName = getQuestionTypeName(el);
         const stem = getStemText(el);
-        const options = getOptions(el);
+        // 优先使用页面真实标签；无法可靠读取时，再按可见选项的显示位置补编号。
+        const options = prepareAnswerOptions(getOptions(el));
 
         if (!stem || stem.length < 3) return { ok: false, detail: '题干提取失败' };
         log(`题干：${stem.slice(0, 70)}${stem.length > 70 ? '…' : ''}`, 'q');
@@ -910,7 +1164,8 @@
         if (needsOptions && options.length < 2) return { ok: false, detail: `选项识别失败（仅 ${options.length} 个）` };
 
         const prompt = buildPrompt(stem, typeName, type, options, el);
-        const aiAnswer = await askAI(prompt);
+        const maxTokens = type === TYPE.SHORT ? 2000 : 400;
+        const aiAnswer = await askAI(prompt, CONFIG.MAX_RETRIES, { maxTokens });
         if (!aiAnswer) return { ok: false, detail: '未获取到 AI 答案' };
         log(`AI 返回：${JSON.stringify(aiAnswer).slice(0, 160)}`, 'ai');
 
@@ -949,7 +1204,7 @@
     }
 
     function buildOptionFallbackPrompt(stem, typeName, type, options, previousAnswer) {
-        const optionText = options.map(o => `${o.letter || '?'}：${o.text}`).join('\n');
+        const optionText = options.map(o => `${answerLetterForOption(o)}：${o.text}`).join('\n');
         const output = type === TYPE.MULTI ? '{"answers":["A","C"]}' : '{"answer":"A"}';
         const previous = JSON.stringify(previousAnswer).slice(0, 300);
         return `请重新判断下面这道${typeName}。\n题目：${stem}\n页面中的可选项（只能从这些选项中选择）：\n${optionText}\n上一次回答无法对应页面选项：${previous}\n要求：只根据题目和选项作答；答案必须是上面列出的选项字母，禁止输出选项正文、解释或其他文字；只输出严格 JSON：${output}`;
@@ -959,8 +1214,8 @@
         let prompt = `题目：${stem}`;
         if (options.length) {
             prompt += `\n选项：\n` + options.map(o => {
-                if (type === TYPE.JUDGE) return `${o.letter}.${o.text}`;
-                return `${o.letter}. ${o.text}`;
+                if (type === TYPE.JUDGE) return `${answerLetterForOption(o)}.${o.text}`;
+                return `${answerLetterForOption(o)}. ${o.text}`;
             }).join('\n');
         }
         prompt += `\n题型：${typeName}`;
@@ -968,13 +1223,21 @@
             const n = blankCount(el);
             prompt += `（共 ${n} 空）\n要求：只输出严格 JSON，不要任何解释、markdown 代码块或多余文字。\n填空题输出 {"answers":["第1空答案","第2空答案"]}`;
         } else if (type === TYPE.MULTI) {
-            prompt += `\n要求：只输出严格 JSON，不要任何解释、markdown 代码块或多余文字。\n多选题输出 {"answers":["A","B"]}`;
+            prompt += `\n要求：只从上方实际列出的选项字母中选择所有正确项；只输出严格 JSON，不要选项正文、解释、markdown 代码块或多余文字。\n多选题输出 {"answers":["A","B"]}`;
         } else if (type === TYPE.JUDGE) {
-            prompt += `\n要求：只输出严格 JSON，不要任何解释、markdown 代码块或多余文字。\n判断题只能输出 {"answer":"对"} 或 {"answer":"错"}`;
+            prompt += `\n要求：只能从上方实际列出的选项字母中选择；只输出严格 JSON，不要选项正文、解释、markdown 代码块或多余文字。\n判断题输出对应选项字母，例如 {"answer":"A"}`;
         } else if (type === TYPE.SHORT) {
-            prompt += `\n要求：只输出严格 JSON，不要任何解释、markdown 代码块或多余文字。\n简答题输出 {"answer":"完整答案文字"}`;
+            if (/材料|阅读|案例|分析/.test(typeName)) {
+                prompt += `\n要求：本题为材料题，请紧扣材料逐问作答，用（1）（2）标明小问；答案完整、具体，不要只写提纲。` +
+                    `只输出严格 JSON，不要解释输出格式，不要 markdown 代码块或多余文字。\n材料题输出 {"answer":"完整作答内容"}`;
+            } else if (/论述|综合|解答|计算/.test(typeName)) {
+                prompt += `\n要求：本题为论述题，请给出结构完整、论点明确、有论证过程的答案，可分段落展开（不少于 300 字）。` +
+                    `只输出严格 JSON，不要解释输出格式，不要 markdown 代码块或多余文字。\n论述题输出 {"answer":"完整答案文字"}`;
+            } else {
+                prompt += `\n要求：答案应完整、准确；只输出严格 JSON，不要任何解释、markdown 代码块或多余文字。\n简答题输出 {"answer":"完整答案文字"}`;
+            }
         } else {
-            prompt += `\n要求：只输出严格 JSON，不要任何解释、markdown 代码块或多余文字。\n单选题输出 {"answer":"A"}`;
+            prompt += `\n要求：答案只能是上方实际列出的选项字母；只输出严格 JSON，不要选项正文、解释、markdown 代码块或多余文字。\n单选题输出 {"answer":"A"}`;
         }
         return prompt;
     }
@@ -986,12 +1249,14 @@
         if (!a.letters.length && !a.values.length) return { ok: false, reason: 'empty-answer', detail: '答案为空' };
 
         let target = null;
-        if (a.letters.length) target = options.find(o => (o.letter || '').toUpperCase() === a.letters[0]);
+        if (a.letters.length) target = options.find(o => answerLetterForOption(o) === a.letters[0]);
         if (!target && a.values.length) target = matchByText(options, a.values[0]);
         if (!target) return { ok: false, reason: 'unmatched-answer', detail: `未匹配到选项 ${a.letters.join('') || a.values[0]}` };
 
         clearQuestion(el, false);
-        selectOption(target, false);
+        const selected = selectOption(target, false, el);
+        syncChoiceHidden(el, false);
+        if (!selected.clicked) requestQuestionSave(el);
         return verifyChoice(el, options, false, [target]);
     }
 
@@ -1001,7 +1266,7 @@
 
         const targets = [];
         for (const L of a.letters) {
-            const t = options.find(o => (o.letter || '').toUpperCase() === L);
+            const t = options.find(o => answerLetterForOption(o) === L);
             if (t && !targets.includes(t)) targets.push(t);
         }
         for (const v of a.values) {
@@ -1014,7 +1279,9 @@
         }
 
         clearQuestion(el, true);
-        targets.forEach(t => selectOption(t, true));
+        const selections = targets.map(t => selectOption(t, true, el));
+        syncChoiceHidden(el, true);
+        if (selections.some(s => !s.clicked)) requestQuestionSave(el);
         return verifyChoice(el, options, true, targets);
     }
 
@@ -1042,7 +1309,9 @@
         }
 
         clearQuestion(el, false);
-        selectOption(target, false);
+        const selected = selectOption(target, false, el);
+        syncChoiceHidden(el, false);
+        if (!selected.clicked) requestQuestionSave(el);
         return verifyChoice(el, options, false, [target]);
     }
 
@@ -1057,15 +1326,15 @@
         const total = blankCount(el);
         let filled = 0;
         for (let i = 1; i <= total; i++) {
-            const ed = getEditor('answerEditor' + qid + i, document.getElementById('answerEditor' + qid + i));
-            let v = '';
-            try { v = ed ? (ed.getContent() || '') : ''; } catch (e) {}
-            if (!v) {
-                const ta = document.getElementById('answerEditor' + qid + i);
-                v = ta ? ta.value : '';
+            const editorId = 'answerEditor' + qid + i;
+            let ta = document.getElementById(editorId);
+            if (!ta) {
+                const all = el.querySelectorAll('.textDIV textarea, .Answer textarea, textarea');
+                ta = all[i - 1] || null;
             }
-            if (String(v).replace(/<[^>]*>/g, '').trim()) filled++;
+            if (meaningfulAnswer(readEditorAnswer(editorId, ta))) filled++;
         }
+        if (filled > 0) requestQuestionSave(el);
         return { ok: filled > 0, detail: `${r.detail}，校验到 ${filled} 空有内容` };
     }
 
@@ -1088,27 +1357,31 @@
         if (t) return t;
         // 3) 值本身是字母
         const L = String(value).trim().toUpperCase();
-        if (/^[A-Z]$/.test(L)) return options.find(o => (o.letter || '').toUpperCase() === L) || null;
+        if (/^[A-Z]$/.test(L)) return options.find(o => answerLetterForOption(o) === L) || null;
         // 4) 值里含字母
         const m = String(value).match(/\b([A-Z])\b/) || String(value).match(/[（(]?([A-Z])[）)]?\s*[.、．]/);
-        if (m) return options.find(o => (o.letter || '').toUpperCase() === m[1]) || null;
+        if (m) return options.find(o => answerLetterForOption(o) === m[1]) || null;
         return null;
     }
 
-    /** 回读校验：确认页面真的登记了答案 */
+    /** 回读校验：确认页面既显示了选中标记，也把答案写进了隐藏域 */
     function verifyChoice(el, options, multi, targets) {
-        const box = hiddenAnswer(el);
-        const cls = multi ? 'check_answer_dx' : 'check_answer';
-        const marked = options.filter(o => o.node && o.node.querySelector('.' + cls));
-        const val = box ? String(box.value || '') : '';
+        const cls = choiceClass(multi);
+        const box = hiddenAnswer(el) || document.querySelector(`input[name="answers${qidOf(el)}"]`);
+        const val = box ? String(box.value || '').trim() : '';
+        const marked = options.filter(o => o.node && isOptionMarked(o.node, multi));
 
         if (!marked.length) {
             return { ok: false, detail: `点击未生效（未出现 ${cls} 标记）` };
         }
-        if (box && !val) {
-            return { ok: false, detail: '选项已标记，但答案隐藏域仍为空' };
+        const missing = (targets || []).filter(t => !t.node || !isOptionMarked(t.node, multi));
+        if (missing.length) {
+            return { ok: false, detail: `部分选项未选中：${missing.map(o => answerLetterForOption(o)).join('、') || '未知'}` };
         }
-        const letters = marked.map(o => o.letter).join('');
+        if (box && !val) {
+            return { ok: false, detail: '选项已标记，但答案隐藏域仍为空（未绑定到答案）' };
+        }
+        const letters = marked.map(o => answerLetterForOption(o)).join('');
         return { ok: true, detail: `已选择 ${letters}${val ? `（页面记录：${val}）` : ''}` };
     }
 
@@ -1116,22 +1389,24 @@
     //  五、AI 调用
     // =========================================================
 
-    async function askAI(prompt, maxRetries = CONFIG.MAX_RETRIES) {
+    async function askAI(prompt, maxRetries = CONFIG.MAX_RETRIES, options = {}) {
+        const maxTokens = Math.max(200, Math.min(4000, Number(options.maxTokens) || 400));
         if (CONFIG.ENABLE_CACHE) {
             const key = cacheKey(prompt);
             const hit = readCache(key);
-            if (hit) { log('命中本地缓存，跳过 API 请求', 'hit'); return hit; }
-            log('本地答案缓存未命中，改用当前选择的 AI 模型回答。', 'step');
+            if (hit) { log('本页面会话里已有这道题的临时答案缓存，跳过重复 AI 请求。', 'hit'); return hit; }
+            const providerLabel = PROVIDERS[CONFIG.PROVIDER]?.label || '当前 AI 模型';
+            log(`本页面会话没有这道题的缓存，正在请求 ${providerLabel} 生成答案。`, 'step');
         }
         for (let attempt = 0; attempt <= maxRetries; attempt++) {
             try {
-                const ans = await callAPI(prompt);
+                const ans = await callAPI(prompt, maxTokens);
                 if (ans) {
                     if (CONFIG.ENABLE_CACHE) writeCache(cacheKey(prompt), ans);
                     return ans;
                 }
             } catch (e) {
-                log(`API 请求失败(${attempt + 1}/${CONFIG.MAX_RETRIES + 1})：${e.message}`, 'err');
+                log(`API 请求失败(${attempt + 1}/${maxRetries + 1})：${e.message}`, 'err');
                 if (e && e.retryable === false) break;
             }
                 if (attempt < maxRetries) await delay(1000 * (attempt + 1));
@@ -1139,13 +1414,14 @@
         return null;
     }
 
-    function callAPI(prompt) {
+    function callAPI(prompt, maxTokens = 400) {
+        const promptLimit = maxTokens >= 1000 ? 8000 : 3000;
         return requestCompletion(
             CONFIG.PROVIDER,
             CONFIG.MODEL,
             CONFIG.API_KEY,
-            prompt.slice(0, 3000),
-            400,
+            prompt.slice(0, promptLimit),
+            maxTokens,
             '你是答题助手，只输出纯净 JSON，禁止使用 ```json 代码块，禁止任何多余文字。'
         ).then(parseAnswer);
     }
@@ -1261,6 +1537,16 @@
         // 去掉裸换行再试
         v = tryJSON(s.replace(/[\r\n]+/g, ' '));
         if (v !== undefined) return v;
+
+        // 主观题输出被 max_tokens 截断时，尽量救回已经生成的正文
+        const truncated = s.match(/^\{\s*"(?:answer|answers)"\s*:\s*"([\s\S]*)$/);
+        if (truncated) {
+            let text = truncated[1];
+            const close = text.lastIndexOf('"}');
+            if (close !== -1) text = text.slice(0, close);
+            text = text.replace(/\\n/g, '\n').replace(/\\"/g, '"').replace(/\\\\/g, '\\').trim();
+            if (text) return { answer: text };
+        }
 
         // 完全不是 JSON：按纯文本处理
         log('AI 返回非 JSON，按纯文本解析', 'warn');

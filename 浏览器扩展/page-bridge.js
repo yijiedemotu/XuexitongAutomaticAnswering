@@ -64,6 +64,20 @@
             result = String(text || textarea.value || '');
           }
         }
+      } else if (message.command === 'save-question') {
+        const qid = String(args.qid || '');
+        if (/^\d+$/.test(qid)) {
+          if (typeof window.saveQuestion === 'function') {
+            window.saveQuestion(qid, qid);
+            result = true;
+          } else if (typeof window.submitForm === 'function') {
+            const jq = window.jQuery || window.$;
+            if (typeof jq === 'function') {
+              window.submitForm(true, jq('#sigleQuestionDiv_' + qid));
+              result = true;
+            }
+          }
+        }
       } else if (message.command === 'submit-work') {
         if (typeof window.submitValidate === 'function') {
           window.submitValidate.call(window, 0);
